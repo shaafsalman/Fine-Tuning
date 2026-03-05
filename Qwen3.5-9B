@@ -1,0 +1,262 @@
+"""
+train-3.5-9B.py  --  Qwen3.5-9B LoRA finetune on MedReasoning-v3
+Hardware : 8 × A100-SXM4-40GB
+Run with : torchrun --nproc_per_node=8 --master_addr=localhost --master_port=29500 train-3.5-9B.py
+"""
+
+import os
+import glob
+import json
+import torch
+import torch.distributed as dist
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+from trl import SFTTrainer, SFTConfig
+from huggingface_hub import HfApi
+
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+
+MODEL_NAME = "Qwen/Qwen3.5-9B"
+DATASET_NAME = "Dataset_name"
+HF_MODEL_REPO = "output_repo"
+
+OUTPUT_DIR = "medreasoning_9b_checkpoints"
+LORA_DIR = OUTPUT_DIR + "_lora"
+MERGED_DIR = OUTPUT_DIR + "_merged"
+
+MAX_SEQ_LEN = 2048
+
+LORA_RANK = 16
+LORA_ALPHA = 32
+
+BATCH_SIZE = 2
+GRAD_ACCUM = 4
+
+EPOCHS = 1
+LR = 2e-4
+WARMUP_STEPS = 5
+SEED = 3407
+
+DATASET_NUM_PROC = 8
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+
+PROMPT_TEMPLATE = (
+    "<|im_start|>system\n{instruction}<|im_end|>\n"
+    "<|im_start|>user\n{input}<|im_end|>\n"
+    "<|im_start|>assistant\n{output}<|im_end|>"
+)
+
+
+def format_medreasoning(examples):
+    texts = []
+
+    for instruction, inp, output in zip(
+        examples["instruction"], examples["input"], examples["output"]
+    ):
+        texts.append(
+            PROMPT_TEMPLATE.format(
+                instruction=instruction.strip(),
+                input=inp.strip(),
+                output=output.strip(),
+            )
+        )
+
+    return {"text": texts}
+
+
+def train():
+
+    if local_rank == 0:
+        print(f"Loading dataset: {DATASET_NAME}")
+
+    dataset = load_dataset(DATASET_NAME, split="train")
+
+    dataset = dataset.map(
+        format_medreasoning,
+        batched=True,
+        remove_columns=dataset.column_names,
+        num_proc=DATASET_NUM_PROC,
+    )
+
+    if local_rank == 0:
+        print("Dataset size:", len(dataset))
+
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        trust_remote_code=True,
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation="sdpa",
+    )
+
+    model.config.use_cache = False
+    model.enable_input_require_grads()
+
+
+    lora_config = LoraConfig(
+        r=LORA_RANK,
+        lora_alpha=LORA_ALPHA,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        lora_dropout=0.0,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    if local_rank == 0:
+        model.print_trainable_parameters()
+
+
+    ckpts = sorted(glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*")))
+    resume = ckpts[-1] if ckpts else None
+
+    if local_rank == 0:
+        print("Resuming from:", resume)
+
+
+    training_args = SFTConfig(
+        output_dir=OUTPUT_DIR,
+        dataset_text_field="text",
+        max_length=MAX_SEQ_LEN,
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUM,
+        num_train_epochs=EPOCHS,
+        warmup_steps=WARMUP_STEPS,
+        learning_rate=LR,
+        lr_scheduler_type="cosine",
+        weight_decay=0.01,
+        bf16=True,
+        tf32=True,
+        logging_steps=10,
+        save_steps=200,
+        save_total_limit=3,
+        optim="adamw_8bit",
+        seed=SEED,
+        dataset_num_proc=DATASET_NUM_PROC,
+        packing=True,
+        dataloader_num_workers=8,
+        report_to="none",
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        ddp_find_unused_parameters=False,
+    )
+
+
+    trainer = SFTTrainer(
+        model=model,
+        processing_class=tokenizer,
+        train_dataset=dataset,
+        args=training_args,
+    )
+
+
+    trainer.train(resume_from_checkpoint=resume)
+
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+    if trainer.is_world_process_zero():
+
+        print("Saving LoRA adapter...")
+
+        model.save_pretrained(LORA_DIR)
+        tokenizer.save_pretrained(LORA_DIR)
+
+        print("Saved adapter:", LORA_DIR)
+
+
+def merge_and_push():
+
+    print("Loading base model for merge")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+
+
+    model = PeftModel.from_pretrained(model, LORA_DIR)
+    model = model.merge_and_unload(progressbar=True)
+
+
+    print("Saving merged model")
+
+    model.save_pretrained(
+        MERGED_DIR,
+        safe_serialization=True,
+        max_shard_size="4GB",
+    )
+
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        trust_remote_code=True,
+    )
+
+    tokenizer.save_pretrained(MERGED_DIR)
+
+
+    if not HF_TOKEN:
+        print("HF_TOKEN not set, skipping push")
+        return
+
+
+    api = HfApi(token=HF_TOKEN)
+
+    api.create_repo(
+        repo_id=HF_MODEL_REPO,
+        repo_type="model",
+        exist_ok=True,
+    )
+
+
+    api.upload_folder(
+        folder_path=MERGED_DIR,
+        repo_id=HF_MODEL_REPO,
+        repo_type="model",
+        commit_message="Add merged Qwen3.5-9B MedReasoning model",
+    )
+
+
+def main():
+
+    train()
+
+    if local_rank == 0:
+        merge_and_push()
+
+
+if __name__ == "__main__":
+    main()
