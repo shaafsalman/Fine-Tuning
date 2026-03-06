@@ -1,5 +1,5 @@
 """
-train-3.5-9B.py  --  Qwen3.5-9B LoRA finetune on MedReasoning-v3
+train-3.5-9B.py  --  Qwen3.5-9B LoRA finetune
 Hardware : 8 × A100-SXM4-40GB
 Run with : torchrun --nproc_per_node=8 --master_addr=localhost --master_port=29500 train-3.5-9B.py
 """
@@ -24,31 +24,26 @@ torch.backends.cudnn.allow_tf32 = True
 
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
+# ── config ────────────────────────────────────────────────────────────────────
+MODEL_NAME     = "Qwen/Qwen3.5-9B"
+DATASET_NAME   = ""           
+HF_MODEL_REPO  = ""           
 
-MODEL_NAME = "Qwen/Qwen3.5-9B"
-DATASET_NAME = ""
-HF_MODEL_REPO = ""
+OUTPUT_DIR  = "medreasoning_9b_checkpoints"
+LORA_DIR    = OUTPUT_DIR + "_lora"
+MERGED_DIR  = OUTPUT_DIR + "_merged"
 
-OUTPUT_DIR = "medreasoning_9b_checkpoints"
-LORA_DIR = OUTPUT_DIR + "_lora"
-MERGED_DIR = OUTPUT_DIR + "_merged"
-
-MAX_SEQ_LEN = 2048
-
-LORA_RANK = 16
-LORA_ALPHA = 32
-
-BATCH_SIZE = 2
-GRAD_ACCUM = 4
-
-EPOCHS = 1
-LR = 2e-4
-WARMUP_STEPS = 5
-SEED = 3407
-
+MAX_SEQ_LEN      = 2048
+LORA_RANK        = 16
+LORA_ALPHA       = 32
+BATCH_SIZE       = 2
+GRAD_ACCUM       = 4
+EPOCHS           = 1
+LR               = 2e-4
+WARMUP_STEPS     = 5
+SEED             = 3407
 DATASET_NUM_PROC = 8
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-
+HF_TOKEN         = os.environ.get("HF_TOKEN", "")
 
 PROMPT_TEMPLATE = (
     "<|im_start|>system\n{instruction}<|im_end|>\n"
@@ -56,6 +51,8 @@ PROMPT_TEMPLATE = (
     "<|im_start|>assistant\n{output}<|im_end|>"
 )
 
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def format_medreasoning(examples):
     texts = []
@@ -74,58 +71,101 @@ def format_medreasoning(examples):
 
 def patch_config_for_vllm(merged_dir):
     """
-    Patch the merged model's config.json so vLLM can serve it correctly.
-    - Sets model_type and architecture to the multimodal conditional generation class
-      (which vLLM's qwen3_5.py expects, used with --language-model-only)
-    - Removes mrope fields that cause rotary embedding shape mismatches under TP
-    - Removes vision/audio/media configs not needed for text-only serving
+    Fix config.json so vLLM serves the merged model correctly:
+      1. Force text-only architecture  (Qwen3_5ForCausalLM)
+      2. Force correct model_type      (qwen3_5)
+      3. Strip mrope_* keys that cause rotary-embedding shape crashes under TP
+      4. Remove any leftover vision/audio/media keys
     """
     config_path = os.path.join(merged_dir, "config.json")
+
+    # backup
+    import shutil
+    shutil.copy2(config_path, config_path + ".bak")
+
     with open(config_path) as f:
         config = json.load(f)
 
-    # vLLM resolves this to Qwen3_5ForConditionalGeneration (qwen3_5.py)
-    # which correctly handles the model.language_model.* weight key structure
-    # Use --language-model-only flag at serve time to run text-only
-    config["model_type"] = "qwen3_5"
-    config["architectures"] = ["Qwen3_5ForConditionalGeneration"]
+    # 1 & 2 – correct arch + model_type
+    config["architectures"] = ["Qwen3_5ForCausalLM"]
+    config["model_type"]    = "qwen3_5"
 
-    # Remove mrope fields - these cause rotary embedding shape mismatches
-    # when running under tensor parallelism with --enforce-eager
-    for section_key in ["rope_scaling", "rope_parameters"]:
-        if section_key in config and isinstance(config[section_key], dict):
-            config[section_key].pop("mrope_section", None)
-            config[section_key].pop("mrope_interleaved", None)
-    config.pop("mrope_section", None)
-    config.pop("mrope_interleaved", None)
+    # 3 – strip mrope fields (cause rotary shape mismatch with TP)
+    MROPE_KEYS = {"mrope_section", "mrope_interleaved"}
+    for rope_field in ("rope_scaling", "rope_parameters"):
+        if rope_field in config and isinstance(config[rope_field], dict):
+            for k in MROPE_KEYS:
+                config[rope_field].pop(k, None)
+    # also strip top-level mrope keys (some model saves put them here)
+    for k in MROPE_KEYS:
+        config.pop(k, None)
 
-    # Remove multimodal configs not needed for text serving
-    for key in ["vision_config", "audio_config", "media_config",
-                "image_token_id", "video_token_id", "audio_token_id"]:
+    # 4 – strip multimodal keys not needed for text serving
+    for key in ("vision_config", "audio_config", "media_config",
+                "image_token_id", "video_token_id", "audio_token_id"):
         config.pop(key, None)
 
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
-    print(f"Patched config: model_type={config['model_type']}, arch={config['architectures']}")
+    print(f"[patch_config] arch={config['architectures']}  model_type={config['model_type']}")
 
 
 def patch_tokenizer_for_vllm(merged_dir):
     """
-    vLLM doesn't recognize the custom tokenizer class from Qwen3.5's multimodal
-    tokenizer_config. Patch it to use the standard fast tokenizer.
+    Remove processor_class (multimodal) and set a plain tokenizer class
+    so vLLM doesn't try to load an image processor that doesn't exist.
     """
     tok_config_path = os.path.join(merged_dir, "tokenizer_config.json")
     with open(tok_config_path) as f:
         tok_config = json.load(f)
 
+    tok_config.pop("processor_class", None)          # kills image-processor lookup
     tok_config["tokenizer_class"] = "PreTrainedTokenizerFast"
 
     with open(tok_config_path, "w") as f:
         json.dump(tok_config, f, indent=2)
 
-    print("Patched tokenizer_config: tokenizer_class=PreTrainedTokenizerFast")
+    print("[patch_tokenizer] processor_class removed, tokenizer_class=PreTrainedTokenizerFast")
 
+
+def rebuild_safetensors_index(merged_dir):
+    """
+    Rebuild model.safetensors.index.json from the actual shard files on disk.
+    Required if the index was overwritten by a base-model download or is stale.
+    """
+    from safetensors import safe_open
+
+    shards = sorted([
+        f for f in os.listdir(merged_dir)
+        if f.endswith(".safetensors")
+    ])
+    if not shards:
+        raise RuntimeError(f"No .safetensors files found in {merged_dir}")
+
+    weight_map  = {}
+    total_size  = 0
+
+    for shard in shards:
+        path        = os.path.join(merged_dir, shard)
+        total_size += os.path.getsize(path)
+        with safe_open(path, framework="pt") as f:
+            for key in f.keys():
+                weight_map[key] = shard
+
+    index = {
+        "metadata":   {"total_size": total_size},
+        "weight_map": weight_map,
+    }
+
+    out = os.path.join(merged_dir, "model.safetensors.index.json")
+    with open(out, "w") as f:
+        json.dump(index, f, indent=2)
+
+    print(f"[rebuild_index] {len(weight_map)} tensors across {len(shards)} shards → {out}")
+
+
+# ── train ─────────────────────────────────────────────────────────────────────
 
 def train():
     if local_rank == 0:
@@ -158,10 +198,8 @@ def train():
     lora_config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
         lora_dropout=0.0,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
@@ -171,7 +209,7 @@ def train():
     if local_rank == 0:
         model.print_trainable_parameters()
 
-    ckpts = sorted(glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*")))
+    ckpts  = sorted(glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*")))
     resume = ckpts[-1] if ckpts else None
     if local_rank == 0:
         print("Resuming from:", resume)
@@ -222,12 +260,10 @@ def train():
         print("Saved adapter:", LORA_DIR)
 
 
+# ── merge & push ──────────────────────────────────────────────────────────────
+
 def merge_and_push():
     print("Loading base model for merge...")
-
-    # Load as the FULL multimodal model (same class used during training).
-    # This preserves the model.language_model.* key structure that vLLM's
-    # Qwen3_5ForConditionalGeneration loader expects.
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
@@ -249,11 +285,12 @@ def merge_and_push():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.save_pretrained(MERGED_DIR)
 
-    # Patch config and tokenizer so vLLM can serve without issues
-    patch_config_for_vllm(MERGED_DIR)
-    patch_tokenizer_for_vllm(MERGED_DIR)
+    # ── critical: patch everything before serving or pushing ──────────────────
+    patch_config_for_vllm(MERGED_DIR)        # fix arch + strip mrope
+    patch_tokenizer_for_vllm(MERGED_DIR)     # remove multimodal processor ref
+    rebuild_safetensors_index(MERGED_DIR)    # ensure index matches actual shards
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Merge complete. Serve with:")
     print(f"  vllm serve {MERGED_DIR} \\")
     print(f"    --port 8000 \\")
@@ -261,9 +298,8 @@ def merge_and_push():
     print(f"    --gpu-memory-utilization 0.85 \\")
     print(f"    --max-model-len 32768 \\")
     print(f"    --served-model-name Qwen35-9B-MedReasoning \\")
-    print(f"    --language-model-only \\")
-    print(f"    --enforce-eager")
-    print("="*60 + "\n")
+    print(f"    --language-model-only")
+    print("=" * 60 + "\n")
 
     if not HF_TOKEN:
         print("HF_TOKEN not set, skipping push")
@@ -275,10 +311,13 @@ def merge_and_push():
         folder_path=MERGED_DIR,
         repo_id=HF_MODEL_REPO,
         repo_type="model",
-        commit_message="Add merged Qwen3.5-9B MedReasoning model",
+        commit_message="Add merged Qwen3.5-9B finetuned model (vLLM-ready)",
+        ignore_patterns=["*.bak"],
     )
-    print(f"Pushed to HuggingFace: {HF_MODEL_REPO}")
+    print(f"✅ Pushed to HuggingFace: https://huggingface.co/{HF_MODEL_REPO}")
 
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     train()
