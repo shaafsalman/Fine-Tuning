@@ -26,8 +26,8 @@ local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
 
 MODEL_NAME = "Qwen/Qwen3.5-9B"
-DATASET_NAME = "Dataset_name"
-HF_MODEL_REPO = "output_repo"
+DATASET_NAME = ""
+HF_MODEL_REPO = ""
 
 OUTPUT_DIR = "medreasoning_9b_checkpoints"
 LORA_DIR = OUTPUT_DIR + "_lora"
@@ -59,7 +59,6 @@ PROMPT_TEMPLATE = (
 
 def format_medreasoning(examples):
     texts = []
-
     for instruction, inp, output in zip(
         examples["instruction"], examples["input"], examples["output"]
     ):
@@ -70,17 +69,69 @@ def format_medreasoning(examples):
                 output=output.strip(),
             )
         )
-
     return {"text": texts}
 
 
-def train():
+def patch_config_for_vllm(merged_dir):
+    """
+    Patch the merged model's config.json so vLLM can serve it correctly.
+    - Sets model_type and architecture to the multimodal conditional generation class
+      (which vLLM's qwen3_5.py expects, used with --language-model-only)
+    - Removes mrope fields that cause rotary embedding shape mismatches under TP
+    - Removes vision/audio/media configs not needed for text-only serving
+    """
+    config_path = os.path.join(merged_dir, "config.json")
+    with open(config_path) as f:
+        config = json.load(f)
 
+    # vLLM resolves this to Qwen3_5ForConditionalGeneration (qwen3_5.py)
+    # which correctly handles the model.language_model.* weight key structure
+    # Use --language-model-only flag at serve time to run text-only
+    config["model_type"] = "qwen3_5"
+    config["architectures"] = ["Qwen3_5ForConditionalGeneration"]
+
+    # Remove mrope fields - these cause rotary embedding shape mismatches
+    # when running under tensor parallelism with --enforce-eager
+    for section_key in ["rope_scaling", "rope_parameters"]:
+        if section_key in config and isinstance(config[section_key], dict):
+            config[section_key].pop("mrope_section", None)
+            config[section_key].pop("mrope_interleaved", None)
+    config.pop("mrope_section", None)
+    config.pop("mrope_interleaved", None)
+
+    # Remove multimodal configs not needed for text serving
+    for key in ["vision_config", "audio_config", "media_config",
+                "image_token_id", "video_token_id", "audio_token_id"]:
+        config.pop(key, None)
+
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+    print(f"Patched config: model_type={config['model_type']}, arch={config['architectures']}")
+
+
+def patch_tokenizer_for_vllm(merged_dir):
+    """
+    vLLM doesn't recognize the custom tokenizer class from Qwen3.5's multimodal
+    tokenizer_config. Patch it to use the standard fast tokenizer.
+    """
+    tok_config_path = os.path.join(merged_dir, "tokenizer_config.json")
+    with open(tok_config_path) as f:
+        tok_config = json.load(f)
+
+    tok_config["tokenizer_class"] = "PreTrainedTokenizerFast"
+
+    with open(tok_config_path, "w") as f:
+        json.dump(tok_config, f, indent=2)
+
+    print("Patched tokenizer_config: tokenizer_class=PreTrainedTokenizerFast")
+
+
+def train():
     if local_rank == 0:
         print(f"Loading dataset: {DATASET_NAME}")
 
     dataset = load_dataset(DATASET_NAME, split="train")
-
     dataset = dataset.map(
         format_medreasoning,
         batched=True,
@@ -91,15 +142,9 @@ def train():
     if local_rank == 0:
         print("Dataset size:", len(dataset))
 
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        trust_remote_code=True,
-    )
-
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -107,40 +152,29 @@ def train():
         trust_remote_code=True,
         attn_implementation="sdpa",
     )
-
     model.config.use_cache = False
     model.enable_input_require_grads()
-
 
     lora_config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
         target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
         ],
         lora_dropout=0.0,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
     )
-
     model = get_peft_model(model, lora_config)
 
     if local_rank == 0:
         model.print_trainable_parameters()
 
-
     ckpts = sorted(glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*")))
     resume = ckpts[-1] if ckpts else None
-
     if local_rank == 0:
         print("Resuming from:", resume)
-
 
     training_args = SFTConfig(
         output_dir=OUTPUT_DIR,
@@ -169,7 +203,6 @@ def train():
         ddp_find_unused_parameters=False,
     )
 
-
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
@@ -177,28 +210,24 @@ def train():
         args=training_args,
     )
 
-
     trainer.train(resume_from_checkpoint=resume)
-
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
-
     if trainer.is_world_process_zero():
-
         print("Saving LoRA adapter...")
-
         model.save_pretrained(LORA_DIR)
         tokenizer.save_pretrained(LORA_DIR)
-
         print("Saved adapter:", LORA_DIR)
 
 
 def merge_and_push():
+    print("Loading base model for merge...")
 
-    print("Loading base model for merge")
-
+    # Load as the FULL multimodal model (same class used during training).
+    # This preserves the model.language_model.* key structure that vLLM's
+    # Qwen3_5ForConditionalGeneration loader expects.
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
@@ -206,54 +235,53 @@ def merge_and_push():
         trust_remote_code=True,
     )
 
-
+    print("Merging LoRA weights...")
     model = PeftModel.from_pretrained(model, LORA_DIR)
     model = model.merge_and_unload(progressbar=True)
 
-
-    print("Saving merged model")
-
+    print(f"Saving merged model to {MERGED_DIR}...")
     model.save_pretrained(
         MERGED_DIR,
         safe_serialization=True,
         max_shard_size="4GB",
     )
 
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        trust_remote_code=True,
-    )
-
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.save_pretrained(MERGED_DIR)
 
+    # Patch config and tokenizer so vLLM can serve without issues
+    patch_config_for_vllm(MERGED_DIR)
+    patch_tokenizer_for_vllm(MERGED_DIR)
+
+    print("\n" + "="*60)
+    print("Merge complete. Serve with:")
+    print(f"  vllm serve {MERGED_DIR} \\")
+    print(f"    --port 8000 \\")
+    print(f"    --tensor-parallel-size 8 \\")
+    print(f"    --gpu-memory-utilization 0.85 \\")
+    print(f"    --max-model-len 32768 \\")
+    print(f"    --served-model-name Qwen35-9B-MedReasoning \\")
+    print(f"    --language-model-only \\")
+    print(f"    --enforce-eager")
+    print("="*60 + "\n")
 
     if not HF_TOKEN:
         print("HF_TOKEN not set, skipping push")
         return
 
-
     api = HfApi(token=HF_TOKEN)
-
-    api.create_repo(
-        repo_id=HF_MODEL_REPO,
-        repo_type="model",
-        exist_ok=True,
-    )
-
-
+    api.create_repo(repo_id=HF_MODEL_REPO, repo_type="model", exist_ok=True)
     api.upload_folder(
         folder_path=MERGED_DIR,
         repo_id=HF_MODEL_REPO,
         repo_type="model",
         commit_message="Add merged Qwen3.5-9B MedReasoning model",
     )
+    print(f"Pushed to HuggingFace: {HF_MODEL_REPO}")
 
 
 def main():
-
     train()
-
     if local_rank == 0:
         merge_and_push()
 
