@@ -1,15 +1,16 @@
 """
-train_dense_ddp.py — Qwen3.5-27B LoRA fine-tune on a medical reasoning dataset
-Hardware : 8 × A100-SXM4-80GB (DDP via torchrun)
-Run with : UNSLOTH_COMPILE_TRANSFORMERS=0 torchrun --nproc_per_node 8 train_dense_ddp.py
+train_dense_ddp.py — Qwen3.5-27B Dense LoRA Fine-Tune  (Unsloth + TRL, DDP)
+=============================================================================
+Hardware  : 8 × A100-SXM4-80GB
+Run with  : UNSLOTH_COMPILE_TRANSFORMERS=0 torchrun --nproc_per_node 8 train_dense_ddp.py
 
 Key design decisions:
-- FastLanguageModel (text-only, not vision)
-- BF16 full precision LoRA (no 4-bit quantization)
-- response_part includes "<think>" so thinking tokens are trained
-- Unsloth gradient checkpointing ("unsloth" mode) for VRAM savings
-- DDP: proper barrier placement, dist init check before barrier
-- Save: only rank-0 saves
+- FastLanguageModel (text-only, not vision) for maximum throughput on dense models
+- BF16 full-precision LoRA (no 4-bit quantisation; 27B fits on 80GB A100 in BF16)
+- response_part includes "<think>" so reasoning/CoT tokens are trained
+- Unsloth gradient checkpointing ("unsloth" mode) reduces VRAM ~30% on long sequences
+- DDP: proper barrier placement, dist.is_initialized() check before barrier call
+- Save: only rank-0 writes checkpoints and uploads to HuggingFace Hub
 """
 
 import os, sys, glob, shutil
@@ -17,36 +18,41 @@ import torch
 import torch.distributed as dist
 
 # ── per-rank GPU assignment ────────────────────────────────────────────────────
+# torchrun sets LOCAL_RANK; each process sees only its own GPU
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
-os.environ["CUDA_VISIBLE_DEVICES"]          = str(local_rank)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"]       = "expandable_segments:True"
-os.environ["TORCHDYNAMO_DISABLE"]           = "1"
-os.environ["UNSLOTH_MOE_BACKEND"]           = "triton"
-os.environ["UNSLOTH_DISABLE_AUTOTUNE"]      = "1"
-os.environ["TRITON_CACHE_DIR"]              = f"/tmp/triton_cache_{local_rank}"
-os.environ["UNSLOTH_COMPILE_TRANSFORMERS"]  = "0"
+os.environ["CUDA_VISIBLE_DEVICES"]         = str(local_rank)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"]      = "expandable_segments:True"
+os.environ["TORCHDYNAMO_DISABLE"]          = "1"   # avoid torch.compile conflicts with Unsloth
+os.environ["UNSLOTH_MOE_BACKEND"]          = "triton"
+os.environ["UNSLOTH_DISABLE_AUTOTUNE"]     = "1"
+os.environ["TRITON_CACHE_DIR"]             = f"/tmp/triton_cache_{local_rank}"   # per-rank cache
+os.environ["UNSLOTH_COMPILE_TRANSFORMERS"] = "0"
 
 # ── config ─────────────────────────────────────────────────────────────────────
-MODEL_NAME          = "unsloth/Qwen3.5-27B"   # use unsloth mirror (faster dl)
-DATASET_NAME        = "<YOUR_DATASET>"         # replace with your dataset
-DATASET_SPLIT       = "train"
-MAX_SEQ_LENGTH      = 2048
-LORA_RANK           = 16
-LORA_ALPHA          = 16
-NUM_TRAIN_EPOCHS    = 1
-BATCH_SIZE          = 2     # 2 per GPU × 8 GPUs = 16 (before grad accum)
-GRAD_ACCUM          = 4     # effective batch = 64
-WARMUP_STEPS        = 5
-LEARNING_RATE       = 2e-4
-SEED                = 3407
-LOGGING_STEPS       = 10
-DATASET_NUM_PROC    = 4
-OUTPUT_DIR          = "outputs_qwen35"
-MERGED_DIR          = "qwen35_merged"
-HF_REPO             = "<YOUR_HF_REPO>"         # e.g. "username/model-name"
-HF_TOKEN            = os.environ.get("HF_TOKEN", "")
+MODEL_NAME       = "unsloth/Qwen3.5-27B"    # Unsloth mirror is faster to download
+DATASET_NAME     = "<YOUR_DATASET>"          # HuggingFace dataset id, e.g. "username/dataset"
+DATASET_SPLIT    = "train"
+MAX_SEQ_LENGTH   = 2048
+LORA_RANK        = 16
+LORA_ALPHA       = 16
 
-# ── clear stale compiled cache (rank 0 only, before dist init) ────────────────
+# Training hyperparameters (tuned for 8 × A100 80GB)
+NUM_TRAIN_EPOCHS = 1
+BATCH_SIZE       = 2     # per-device; effective = 2 × 4 accum × 8 GPUs = 64
+GRAD_ACCUM       = 4
+WARMUP_STEPS     = 5
+LEARNING_RATE    = 2e-4
+SEED             = 3407
+LOGGING_STEPS    = 10
+DATASET_NUM_PROC = 4     # CPU workers for dataset preprocessing
+
+OUTPUT_DIR  = "outputs_qwen35_27b"
+MERGED_DIR  = "qwen35_27b_merged"
+HF_REPO     = "<YOUR_HF_REPO>"    # e.g. "username/model-name"
+HF_TOKEN    = os.environ.get("HF_TOKEN", "")
+
+# ── clear stale compiled cache (rank-0 only, before dist init) ────────────────
+# Stale Unsloth compiled cache can cause dtype mismatch errors on restart
 if local_rank == 0:
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unsloth_compiled_cache")
     if os.path.exists(cache_dir):
@@ -54,6 +60,7 @@ if local_rank == 0:
         print(f"Cleared stale compiled cache: {cache_dir}")
 
 # ── unsloth imports ────────────────────────────────────────────────────────────
+# Must be imported after env vars are set so patches apply correctly
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import train_on_responses_only
 from datasets import load_dataset
@@ -63,15 +70,19 @@ if local_rank == 0:
     print(f"GPU {local_rank}: {torch.cuda.get_device_name(0)}")
 
 # ── load model ─────────────────────────────────────────────────────────────────
+# BF16 full precision (load_in_4bit=False, load_in_8bit=False)
+# 27B in BF16 ≈ 54 GB; fits comfortably on a single A100 80GB
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name      = MODEL_NAME,
-    max_seq_length  = MAX_SEQ_LENGTH,
-    load_in_4bit    = False,
-    load_in_8bit    = False,   # BF16 full precision
-    full_finetuning = False,   # LoRA
+    model_name     = MODEL_NAME,
+    max_seq_length = MAX_SEQ_LENGTH,
+    load_in_4bit   = False,
+    load_in_8bit   = False,
+    full_finetuning= False,   # LoRA; set True to train all weights (much more VRAM)
 )
 
 # ── LoRA adapters ──────────────────────────────────────────────────────────────
+# out_proj is also included for 27B; increases trainable params slightly
+# use_gradient_checkpointing="unsloth" saves ~30% VRAM on long sequences
 model = FastLanguageModel.get_peft_model(
     model,
     r                       = LORA_RANK,
@@ -83,7 +94,7 @@ model = FastLanguageModel.get_peft_model(
         "gate_proj", "up_proj", "down_proj",        # FFN
         "out_proj",
     ],
-    use_gradient_checkpointing = "unsloth",  # ~30% less VRAM on long seqs
+    use_gradient_checkpointing = "unsloth",
     random_state            = SEED,
     use_rslora              = False,
     loftq_config            = None,
@@ -92,7 +103,7 @@ model.config.use_cache = False
 
 # ── dataset formatting ─────────────────────────────────────────────────────────
 # Qwen3.5 uses ChatML format: <|im_start|>role\ncontent<|im_end|>
-# The <think>...</think> block in the output trains the model's CoT reasoning.
+# Including <think>...</think> in the output teaches chain-of-thought reasoning
 PROMPT_TEMPLATE = """\
 <|im_start|>system
 {instruction}<|im_end|>
@@ -102,6 +113,7 @@ PROMPT_TEMPLATE = """\
 {output}<|im_end|>"""
 
 def format_dataset(examples):
+    """Convert Alpaca-style batch rows into ChatML-formatted text strings."""
     texts = []
     for instruction, inp, output in zip(
         examples["instruction"],
@@ -121,9 +133,9 @@ if local_rank == 0:
 dataset = load_dataset(DATASET_NAME, split=DATASET_SPLIT)
 dataset = dataset.map(
     format_dataset,
-    batched         = True,
-    remove_columns  = dataset.column_names,
-    num_proc        = DATASET_NUM_PROC,
+    batched        = True,
+    remove_columns = dataset.column_names,
+    num_proc       = DATASET_NUM_PROC,
 )
 
 if local_rank == 0:
@@ -131,9 +143,9 @@ if local_rank == 0:
 
 # ── trainer ────────────────────────────────────────────────────────────────────
 trainer = SFTTrainer(
-    model           = model,
-    tokenizer       = tokenizer,
-    train_dataset   = dataset,
+    model         = model,
+    tokenizer     = tokenizer,
+    train_dataset = dataset,
     args = SFTConfig(
         dataset_text_field          = "text",
         max_seq_length              = MAX_SEQ_LENGTH,
@@ -152,7 +164,7 @@ trainer = SFTTrainer(
         optim                       = "adamw_8bit",
         seed                        = SEED,
         dataset_num_proc            = DATASET_NUM_PROC,
-        packing                     = True,
+        packing                     = True,    # fill sequences to MAX_SEQ_LENGTH
         dataloader_num_workers      = 4,
         dataloader_pin_memory       = True,
         report_to                   = "none",
@@ -161,16 +173,15 @@ trainer = SFTTrainer(
 )
 
 # ── train on responses only ────────────────────────────────────────────────────
-# instruction_part / response_part tell the trainer which tokens to compute loss on.
-# Including "<think>" in response_part means the model learns to produce
-# chain-of-thought reasoning before the final answer.
+# Loss is computed only on assistant tokens (not on user/system tokens).
+# Including "<think>" in response_part means CoT reasoning tokens are trained.
 trainer = train_on_responses_only(
     trainer,
     instruction_part = "<|im_start|>user\n",
     response_part    = "<|im_start|>assistant\n<think>",
 )
 
-# ── resume from checkpoint if exists ──────────────────────────────────────────
+# ── resume from checkpoint if one exists ──────────────────────────────────────
 ckpts  = sorted(glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*")))
 resume = ckpts[-1] if ckpts else False
 if local_rank == 0:
@@ -179,15 +190,17 @@ if local_rank == 0:
 # ── train ──────────────────────────────────────────────────────────────────────
 trainer_stats = trainer.train(resume_from_checkpoint=resume)
 
-# ── save (rank 0 only) ─────────────────────────────────────────────────────────
+# ── save (rank-0 only) ─────────────────────────────────────────────────────────
+# Barrier ensures all ranks have finished before rank-0 writes checkpoints
 if dist.is_available() and dist.is_initialized():
-    dist.barrier()  # wait for all ranks to finish before saving
+    dist.barrier()
 
 if local_rank == 0:
     print("Training complete. Saving LoRA adapters...")
     model.save_pretrained(OUTPUT_DIR + "_lora")
     tokenizer.save_pretrained(OUTPUT_DIR + "_lora")
 
+    # Merge LoRA into base weights as a standalone 16-bit model for vLLM serving
     print("Merging to 16-bit...")
     model.save_pretrained_merged(MERGED_DIR, tokenizer, save_method="merged_16bit")
     print(f"Saved merged model to: {MERGED_DIR}")

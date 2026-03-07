@@ -1,7 +1,16 @@
 """
-train-3.5-9B.py  --  Qwen3.5-9B LoRA finetune
-Hardware : 8 × A100-SXM4-40GB
-Run with : torchrun --nproc_per_node=8 --master_addr=localhost --master_port=29500 train-3.5-9B.py
+Qwen3.5-9B LoRA Fine-Tune  (Standard HuggingFace / TRL stack, DDP)
+====================================================================
+Hardware  : 8 × A100-SXM4-40GB  (or 80GB)
+Run with  : torchrun --nproc_per_node=8 --master_addr=localhost --master_port=29500 Qwen3.5-9B.py
+
+Design decisions:
+- Standard HuggingFace transformers + PEFT + TRL (no Unsloth dependency)
+- BF16 training with torch sdpa attention and tf32 matmul for extra speed
+- adamw_8bit optimiser cuts VRAM vs standard AdamW
+- Sequence packing (packing=True) maximises GPU utilisation on long contexts
+- vLLM config/tokenizer patches applied post-merge so the served model loads
+  cleanly as a text-only dense model (strips multimodal and mrope fields)
 """
 
 import os
@@ -15,36 +24,44 @@ from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from trl import SFTTrainer, SFTConfig
 from huggingface_hub import HfApi
 
-
+# Enable TF32 for matrix multiplications — speeds up BF16 training on A100
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+# Per-rank GPU identity set by torchrun
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-# ── config ────────────────────────────────────────────────────────────────────
-MODEL_NAME     = "Qwen/Qwen3.5-9B"
-DATASET_NAME   = ""           
-HF_MODEL_REPO  = ""           
+# ── config ─────────────────────────────────────────────────────────────────────
+MODEL_NAME    = "Qwen/Qwen3.5-9B"
+DATASET_NAME  = ""    # HuggingFace dataset id, e.g. "username/dataset"
+HF_MODEL_REPO = ""    # destination repo, e.g. "username/model-name"
 
-OUTPUT_DIR  = "medreasoning_9b_checkpoints"
-LORA_DIR    = OUTPUT_DIR + "_lora"
-MERGED_DIR  = OUTPUT_DIR + "_merged"
+OUTPUT_DIR = "qwen35_9b_checkpoints"
+LORA_DIR   = OUTPUT_DIR + "_lora"
+MERGED_DIR = OUTPUT_DIR + "_merged"
 
+# Sequence & LoRA hyperparameters
 MAX_SEQ_LEN      = 2048
 LORA_RANK        = 16
 LORA_ALPHA       = 32
-BATCH_SIZE       = 2
+
+# Training hyperparameters (tuned for 8 × A100)
+BATCH_SIZE       = 2     # per-device; effective = 2 × 4 accum × 8 GPUs = 64
 GRAD_ACCUM       = 4
 EPOCHS           = 1
 LR               = 2e-4
 WARMUP_STEPS     = 5
 SEED             = 3407
-DATASET_NUM_PROC = 8
-HF_TOKEN         = os.environ.get("HF_TOKEN", "")
+DATASET_NUM_PROC = 8     # CPU workers for dataset preprocessing
 
+# Token read from environment; set via `export HF_TOKEN=hf_...` before running
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+# ── prompt template ────────────────────────────────────────────────────────────
+# Qwen3.5 uses ChatML format.  Instruction/input/output map to
+# system / user / assistant roles respectively.
 PROMPT_TEMPLATE = (
     "<|im_start|>system\n{instruction}<|im_end|>\n"
     "<|im_start|>user\n{input}<|im_end|>\n"
@@ -52,9 +69,10 @@ PROMPT_TEMPLATE = (
 )
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────────────
 
-def format_medreasoning(examples):
+def format_dataset(examples):
+    """Convert Alpaca-style batch rows into ChatML-formatted text strings."""
     texts = []
     for instruction, inp, output in zip(
         examples["instruction"], examples["input"], examples["output"]
@@ -72,35 +90,31 @@ def format_medreasoning(examples):
 def patch_config_for_vllm(merged_dir):
     """
     Fix config.json so vLLM serves the merged model correctly:
-      1. Force text-only architecture  (Qwen3_5ForCausalLM)
-      2. Force correct model_type      (qwen3_5)
+      1. Force text-only architecture (Qwen3_5ForCausalLM)
+      2. Force correct model_type (qwen3_5)
       3. Strip mrope_* keys that cause rotary-embedding shape crashes under TP
-      4. Remove any leftover vision/audio/media keys
+      4. Remove leftover vision/audio/media keys from the base model checkpoint
     """
     config_path = os.path.join(merged_dir, "config.json")
-
-    # backup
     import shutil
-    shutil.copy2(config_path, config_path + ".bak")
+    shutil.copy2(config_path, config_path + ".bak")   # keep a backup
 
     with open(config_path) as f:
         config = json.load(f)
 
-    # 1 & 2 – correct arch + model_type
     config["architectures"] = ["Qwen3_5ForCausalLM"]
     config["model_type"]    = "qwen3_5"
 
-    # 3 – strip mrope fields (cause rotary shape mismatch with TP)
+    # mrope fields cause rotary-embedding shape mismatches under tensor parallelism
     MROPE_KEYS = {"mrope_section", "mrope_interleaved"}
     for rope_field in ("rope_scaling", "rope_parameters"):
         if rope_field in config and isinstance(config[rope_field], dict):
             for k in MROPE_KEYS:
                 config[rope_field].pop(k, None)
-    # also strip top-level mrope keys (some model saves put them here)
     for k in MROPE_KEYS:
         config.pop(k, None)
 
-    # 4 – strip multimodal keys not needed for text serving
+    # Remove multimodal keys — not needed for text-only vLLM serving
     for key in ("vision_config", "audio_config", "media_config",
                 "image_token_id", "video_token_id", "audio_token_id"):
         config.pop(key, None)
@@ -114,13 +128,13 @@ def patch_config_for_vllm(merged_dir):
 def patch_tokenizer_for_vllm(merged_dir):
     """
     Remove processor_class (multimodal) and set a plain tokenizer class
-    so vLLM doesn't try to load an image processor that doesn't exist.
+    so vLLM doesn't attempt to load an image processor that doesn't exist.
     """
     tok_config_path = os.path.join(merged_dir, "tokenizer_config.json")
     with open(tok_config_path) as f:
         tok_config = json.load(f)
 
-    tok_config.pop("processor_class", None)          # kills image-processor lookup
+    tok_config.pop("processor_class", None)
     tok_config["tokenizer_class"] = "PreTrainedTokenizerFast"
 
     with open(tok_config_path, "w") as f:
@@ -132,7 +146,7 @@ def patch_tokenizer_for_vllm(merged_dir):
 def rebuild_safetensors_index(merged_dir):
     """
     Rebuild model.safetensors.index.json from the actual shard files on disk.
-    Required if the index was overwritten by a base-model download or is stale.
+    Required when the index is stale or was overwritten by a base-model download.
     """
     from safetensors import safe_open
 
@@ -143,8 +157,8 @@ def rebuild_safetensors_index(merged_dir):
     if not shards:
         raise RuntimeError(f"No .safetensors files found in {merged_dir}")
 
-    weight_map  = {}
-    total_size  = 0
+    weight_map = {}
+    total_size = 0
 
     for shard in shards:
         path        = os.path.join(merged_dir, shard)
@@ -165,7 +179,7 @@ def rebuild_safetensors_index(merged_dir):
     print(f"[rebuild_index] {len(weight_map)} tensors across {len(shards)} shards → {out}")
 
 
-# ── train ─────────────────────────────────────────────────────────────────────
+# ── train ──────────────────────────────────────────────────────────────────────
 
 def train():
     if local_rank == 0:
@@ -173,7 +187,7 @@ def train():
 
     dataset = load_dataset(DATASET_NAME, split="train")
     dataset = dataset.map(
-        format_medreasoning,
+        format_dataset,
         batched=True,
         remove_columns=dataset.column_names,
         num_proc=DATASET_NUM_PROC,
@@ -190,11 +204,12 @@ def train():
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        attn_implementation="sdpa",   # scaled dot-product attention (torch >= 2.0)
     )
     model.config.use_cache = False
     model.enable_input_require_grads()
 
+    # LoRA adapter — targets attention + FFN projections
     lora_config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
@@ -209,6 +224,7 @@ def train():
     if local_rank == 0:
         model.print_trainable_parameters()
 
+    # Resume from the latest checkpoint if one exists
     ckpts  = sorted(glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*")))
     resume = ckpts[-1] if ckpts else None
     if local_rank == 0:
@@ -250,9 +266,11 @@ def train():
 
     trainer.train(resume_from_checkpoint=resume)
 
+    # Synchronise all ranks before saving
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
+    # Only rank-0 saves to avoid concurrent writes
     if trainer.is_world_process_zero():
         print("Saving LoRA adapter...")
         model.save_pretrained(LORA_DIR)
@@ -260,9 +278,10 @@ def train():
         print("Saved adapter:", LORA_DIR)
 
 
-# ── merge & push ──────────────────────────────────────────────────────────────
+# ── merge & push ───────────────────────────────────────────────────────────────
 
 def merge_and_push():
+    """Merge LoRA weights into the base model, patch for vLLM, and push to Hub."""
     print("Loading base model for merge...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -285,10 +304,10 @@ def merge_and_push():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.save_pretrained(MERGED_DIR)
 
-    # ── critical: patch everything before serving or pushing ──────────────────
-    patch_config_for_vllm(MERGED_DIR)        # fix arch + strip mrope
-    patch_tokenizer_for_vllm(MERGED_DIR)     # remove multimodal processor ref
-    rebuild_safetensors_index(MERGED_DIR)    # ensure index matches actual shards
+    # Apply patches required for clean vLLM serving
+    patch_config_for_vllm(MERGED_DIR)
+    patch_tokenizer_for_vllm(MERGED_DIR)
+    rebuild_safetensors_index(MERGED_DIR)
 
     print("\n" + "=" * 60)
     print("Merge complete. Serve with:")
@@ -297,7 +316,6 @@ def merge_and_push():
     print(f"    --tensor-parallel-size 8 \\")
     print(f"    --gpu-memory-utilization 0.85 \\")
     print(f"    --max-model-len 32768 \\")
-    print(f"    --served-model-name Qwen35-9B-MedReasoning \\")
     print(f"    --language-model-only")
     print("=" * 60 + "\n")
 
@@ -311,13 +329,13 @@ def merge_and_push():
         folder_path=MERGED_DIR,
         repo_id=HF_MODEL_REPO,
         repo_type="model",
-        commit_message="Add merged Qwen3.5-9B finetuned model (vLLM-ready)",
+        commit_message="Add merged Qwen3.5-9B fine-tuned model (vLLM-ready)",
         ignore_patterns=["*.bak"],
     )
-    print(f"✅ Pushed to HuggingFace: https://huggingface.co/{HF_MODEL_REPO}")
+    print(f"Pushed to HuggingFace: https://huggingface.co/{HF_MODEL_REPO}")
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── main ───────────────────────────────────────────────────────────────────────
 
 def main():
     train()

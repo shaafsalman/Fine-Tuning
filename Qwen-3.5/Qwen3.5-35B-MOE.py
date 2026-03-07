@@ -1,3 +1,19 @@
+"""
+Qwen3.5-35B-A3B MoE LoRA Fine-Tune  (Standard HuggingFace / TRL stack)
+=======================================================================
+Hardware  : 8 × A100 80GB  (DDP via torchrun)
+Run with  : torchrun --nproc_per_node=8 --master_addr=localhost --master_port=29500 Qwen3.5-35B-MOE.py
+
+Model notes:
+- Qwen3.5-35B-A3B is a Mixture-of-Experts model: 35B total params, ~3B active per token
+- AutoModelForImageTextToText must be used (not AutoModelForCausalLM) so that vision
+  encoder weights are loaded correctly; otherwise vLLM will report 400+ missing keys
+- LoRA target modules use fully-qualified paths under the VLM wrapper
+  (language_model.layers.*.self_attn.*) so PEFT matches the correct parameter names
+- Full processor (not just tokenizer) is saved alongside the adapter to ensure
+  preprocessor_config.json and video_preprocessor_config.json are present for vLLM
+"""
+
 import os
 import glob
 import json
@@ -9,23 +25,33 @@ from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from trl import SFTTrainer, SFTConfig
 from huggingface_hub import HfApi
 
-DATASET_NAME  = "Dataset_name"
+# ── config ─────────────────────────────────────────────────────────────────────
+DATASET_NAME  = ""                    # HuggingFace dataset id, e.g. "username/dataset"
 MODEL_NAME    = "Qwen/Qwen3.5-35B-A3B"
-HF_MODEL_REPO = "output_repo"
-OUTPUT_DIR    = "medreasoning_checkpoints"
+HF_MODEL_REPO = ""                    # destination repo, e.g. "username/model-name"
+OUTPUT_DIR    = "qwen35_moe_checkpoints"
 LORA_DIR      = OUTPUT_DIR + "_lora"
 MERGED_DIR    = OUTPUT_DIR + "_merged"
+
+# Sequence & LoRA hyperparameters
 MAX_SEQ_LEN   = 2048
 LORA_RANK     = 16
 LORA_ALPHA    = 32
-BATCH_SIZE    = 1
-GRAD_ACCUM    = 4
+
+# Training hyperparameters (tuned for 8 × A100 80GB)
+BATCH_SIZE    = 1     # per-device batch size; MoE is memory-intensive
+GRAD_ACCUM    = 4     # effective batch = 1 × 4 × 8 GPUs = 32
 EPOCHS        = 3
 LR            = 2e-4
 WARMUP_STEPS  = 100
 SEED          = 3407
+
+# Token read from environment; set via `export HF_TOKEN=hf_...` before running
 HF_TOKEN      = os.environ.get("HF_TOKEN", "")
 
+# ── prompt template ────────────────────────────────────────────────────────────
+# Qwen3.5 uses the ChatML format.  Instruction/input/output map to
+# system / user / assistant roles respectively.
 PROMPT_TEMPLATE = (
     "<|im_start|>system\n{instruction}<|im_end|>\n"
     "<|im_start|>user\n{input}<|im_end|>\n"
@@ -33,7 +59,8 @@ PROMPT_TEMPLATE = (
 )
 
 
-def format_medreasoning(examples):
+def format_dataset(examples):
+    """Convert Alpaca-style batch rows into ChatML-formatted text strings."""
     texts = []
     for instruction, inp, output in zip(
         examples["instruction"], examples["input"], examples["output"]
@@ -47,17 +74,18 @@ def format_medreasoning(examples):
 
 
 def train():
+    # Load dataset and convert to flat text strings
     dataset = load_dataset(DATASET_NAME, split="train")
     dataset = dataset.map(
-        format_medreasoning,
+        format_dataset,
         batched=True,
         remove_columns=dataset.column_names,
-        num_proc=8,
+        num_proc=8,     # parallelise preprocessing across 8 CPU workers
     )
 
-    # FIX: use AutoProcessor (not AutoTokenizer) so all processor files are
-    # saved alongside the adapter — prevents missing preprocessor_config.json
-    # and video_preprocessor_config.json during merge/push
+    # Use AutoProcessor (not AutoTokenizer) so all processor files are saved
+    # alongside the adapter — prevents missing preprocessor_config.json and
+    # video_preprocessor_config.json during merge/push
     processor = AutoProcessor.from_pretrained(
         MODEL_NAME,
         trust_remote_code=True,
@@ -67,26 +95,22 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # FIX: use AutoModelForImageTextToText (not AutoModelForCausalLM) so the
-    # full VLM is loaded including vision encoder weights. Using CausalLM
-    # produces a text-only checkpoint that causes 400+ missing visual.*
-    # weight errors when vLLM tries to load Qwen3_5MoeForConditionalGeneration
+    # Use AutoModelForImageTextToText (not AutoModelForCausalLM) so the full
+    # VLM is loaded including vision encoder weights
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        attn_implementation="sdpa",   # scaled dot-product attention (torch >= 2.0)
     )
     model.config.use_cache = False
     model.enable_input_require_grads()
 
+    # LoRA adapter — target attention projections only via fully-qualified paths
+    # that match the VLM wrapper's parameter namespace
     lora_config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
-        # FIX: target_modules must use fully-qualified paths matching the VLM
-        # model's parameter names (language_model.layers.X.self_attn.*_proj).
-        # Using bare names like "q_proj" causes PEFT to match nothing under the
-        # VLM wrapper, resulting in all LoRA keys being "missing" at merge time.
         target_modules=[
             "language_model.layers.*.self_attn.q_proj",
             "language_model.layers.*.self_attn.k_proj",
@@ -100,6 +124,7 @@ def train():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    # Resume from the latest checkpoint if one exists
     ckpts = sorted(glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*")))
     resume = ckpts[-1] if ckpts else False
 
@@ -114,7 +139,7 @@ def train():
         learning_rate=LR,
         lr_scheduler_type="cosine",
         weight_decay=0.01,
-        bf16=True,
+        bf16=True,                                    # bfloat16 training (A100 native)
         max_grad_norm=1.0,
         logging_steps=10,
         save_steps=200,
@@ -122,7 +147,7 @@ def train():
         optim="adamw_torch_fused",
         seed=SEED,
         dataset_num_proc=8,
-        packing=True,
+        packing=True,                                 # pack short sequences → fewer padding tokens
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         report_to="none",
@@ -139,17 +164,17 @@ def train():
     )
     trainer.train(resume_from_checkpoint=resume)
 
+    # Only rank-0 saves the adapter after all processes finish training
     if trainer.is_world_process_zero():
         print("Saving LoRA adapter...")
         model.save_pretrained(LORA_DIR)
-        # FIX: save full processor (not just tokenizer) so
-        # preprocessor_config.json, video_preprocessor_config.json, and
-        # processor_config.json are all present for vLLM
+        # Save full processor so all config files are present for vLLM
         processor.save_pretrained(LORA_DIR)
         print(f"Adapter saved to {LORA_DIR}")
 
 
 def merge_and_push():
+    """Merge LoRA weights into the base model and push to HuggingFace Hub."""
     print("Loading base model for merge...")
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_NAME,
@@ -168,9 +193,8 @@ def merge_and_push():
     processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
     processor.save_pretrained(MERGED_DIR)
 
-    # FIX: patch tokenizer_class — PEFT adapter save writes "TokenizersBackend"
-    # which vLLM rejects. Must be "Qwen2TokenizerFast" to match the processor
-    # class Qwen3VLProcessor expects (Qwen2Tokenizer / Qwen2TokenizerFast)
+    # Patch tokenizer_class — PEFT adapter save writes "TokenizersBackend"
+    # which vLLM rejects; set it to the expected Qwen2TokenizerFast class
     tok_cfg_path = os.path.join(MERGED_DIR, "tokenizer_config.json")
     with open(tok_cfg_path) as f:
         tok_cfg = json.load(f)
@@ -179,9 +203,8 @@ def merge_and_push():
         json.dump(tok_cfg, f, indent=2)
     print("Patched tokenizer_class -> Qwen2TokenizerFast")
 
-    # FIX: ensure config.json has the VLM architecture, not the text-only
-    # variant (qwen3_5_moe_text / Qwen3_5MoeForCausalLM) that CausalLM saves.
-    # vLLM resolves "Qwen3_5MoeForConditionalGeneration" but not the text variant.
+    # Ensure config.json reflects the VLM architecture so vLLM can resolve
+    # the correct model class (Qwen3_5MoeForConditionalGeneration)
     cfg_path = os.path.join(MERGED_DIR, "config.json")
     with open(cfg_path) as f:
         cfg = json.load(f)
@@ -196,15 +219,15 @@ def merge_and_push():
         return
 
     print(f"Pushing to {HF_MODEL_REPO}...")
-    # FIX: use HfApi.upload_folder instead of model.push_to_hub to avoid
-    # deprecated safe_serialization kwarg issues with large sharded models
+    # Use HfApi.upload_folder to avoid deprecated safe_serialization kwarg
+    # issues that arise with model.push_to_hub on large sharded models
     api = HfApi(token=HF_TOKEN)
     api.create_repo(repo_id=HF_MODEL_REPO, repo_type="model", exist_ok=True)
     api.upload_folder(
         folder_path=MERGED_DIR,
         repo_id=HF_MODEL_REPO,
         repo_type="model",
-        commit_message="Add merged Qwen3.5-35B-A3B MedReasoning model",
+        commit_message="Add merged Qwen3.5-35B-A3B fine-tuned model",
     )
     print(f"Done — https://huggingface.co/{HF_MODEL_REPO}")
 
@@ -212,6 +235,7 @@ def merge_and_push():
 def main():
     train()
 
+    # Only rank-0 runs the merge+push step
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if local_rank == 0:
         merge_and_push()
