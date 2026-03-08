@@ -64,8 +64,6 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 )
 
 # ── 2. LoRA adapters ───────────────────────────────────────────────────────────
-# Targets attention projections + FFN gate/up/down — covers the bulk of
-# learned representations for both language understanding and generation
 model = FastLanguageModel.get_peft_model(
     model,
     r                          = LORA_R,
@@ -83,8 +81,6 @@ model = FastLanguageModel.get_peft_model(
 )
 
 # ── 3. load & format dataset ───────────────────────────────────────────────────
-# main_process_first: only rank-0 downloads/processes, all other ranks wait.
-# Prevents 8 processes hitting the HuggingFace Hub simultaneously.
 state = PartialState()
 
 with state.main_process_first():
@@ -116,7 +112,7 @@ with state.main_process_first():
     dataset = dataset.map(
         format_example,
         remove_columns = dataset.column_names,
-        num_proc       = 8,    # parallel CPU preprocessing
+        num_proc       = 8,
     )
 
 # ── 4. trainer ─────────────────────────────────────────────────────────────────
@@ -127,7 +123,7 @@ trainer = SFTTrainer(
     max_seq_length = MAX_SEQ_LENGTH,
     args = SFTConfig(
         dataset_text_field          = "text",
-        packing                     = True,              # fills sequences to MAX_SEQ_LENGTH
+        packing                     = True,
         per_device_train_batch_size = PER_DEVICE_BATCH,
         gradient_accumulation_steps = GRAD_ACCUM,
         num_train_epochs            = NUM_EPOCHS,
@@ -137,7 +133,7 @@ trainer = SFTTrainer(
         lr_scheduler_type           = LR_SCHEDULER,
         weight_decay                = WEIGHT_DECAY,
         fp16                        = not torch.cuda.is_bf16_supported(),
-        bf16                        = torch.cuda.is_bf16_supported(),    # A100 natively supports BF16
+        bf16                        = torch.cuda.is_bf16_supported(),
         logging_steps               = 10,
         save_steps                  = 200,
         save_total_limit            = 3,
@@ -148,8 +144,8 @@ trainer = SFTTrainer(
         ddp_find_unused_parameters  = False,
         dataloader_num_workers      = 4,
         dataloader_pin_memory       = True,
-        neftune_noise_alpha         = 5,           # mild noise regularisation for instruction tuning
-        optim                       = "adamw_8bit",# 8-bit Adam saves ~2 GB VRAM per GPU
+        neftune_noise_alpha         = 5,
+        optim                       = "adamw_8bit",
     ),
 )
 
@@ -160,7 +156,6 @@ print(f"Training complete. Steps: {trainer_stats.global_step}")
 print(f"Peak VRAM per GPU: {torch.cuda.max_memory_reserved() / 1e9:.2f} GB")
 
 # ── 6. save LoRA adapter ───────────────────────────────────────────────────────
-# Only rank-0 saves to avoid concurrent writes to the same directory
 if int(os.environ.get("LOCAL_RANK", 0)) == 0:
     adapter_dir = os.path.join(OUTPUT_DIR, "final-adapter")
     model.save_pretrained(adapter_dir)
@@ -168,8 +163,6 @@ if int(os.environ.get("LOCAL_RANK", 0)) == 0:
     print(f"LoRA adapter saved → {adapter_dir}")
 
 # ── 7. merge LoRA into base model for vLLM serving ────────────────────────────
-# Merging produces a standalone model with no adapter loading overhead.
-# save_method="merged_16bit" writes BF16 weights compatible with vLLM.
 if int(os.environ.get("LOCAL_RANK", 0)) == 0:
     print("Merging LoRA into base model for vLLM …")
     model.save_pretrained_merged(
@@ -189,7 +182,33 @@ if int(os.environ.get("LOCAL_RANK", 0)) == 0:
     )
     print(f"Done → https://huggingface.co/{HF_PUSH_REPO}")
 
-# ── 9. vLLM serve command ──────────────────────────────────────────────────────
+# ── 9. fix tokenizer: replace with base model tokenizer files ─────────────────
+# Unsloth writes a custom TokenizersBackend tokenizer that vLLM can't load.
+# Fix: overwrite with the base model's standard tokenizer files.
+if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+    print("Fixing tokenizer: replacing with base model tokenizer files …")
+    from huggingface_hub import snapshot_download, HfApi
+    import shutil
+
+    base_tokenizer_dir = os.path.join(OUTPUT_DIR, "base_tokenizer_tmp")
+    snapshot_download(
+        MODEL_NAME,
+        local_dir       = base_tokenizer_dir,
+        ignore_patterns = ["*.safetensors", "*.bin", "*.pt"],
+    )
+
+    api = HfApi()
+    api.upload_folder(
+        folder_path    = base_tokenizer_dir,
+        repo_id        = HF_PUSH_REPO,
+        repo_type      = "model",
+        commit_message = "Fix tokenizer: replace with base model tokenizer files",
+    )
+
+    shutil.rmtree(base_tokenizer_dir)
+    print(f"Tokenizer fixed → https://huggingface.co/{HF_PUSH_REPO}")
+
+# ── 10. vLLM serve command ─────────────────────────────────────────────────────
 if int(os.environ.get("LOCAL_RANK", 0)) == 0:
     print(f"""
 To serve with vLLM:
