@@ -39,7 +39,7 @@ model = FastLanguageModel.get_peft_model(
 )
 
 # ── dataset ───────────────────────────────────────────────────────────────────
-ds = load_dataset("Zaynoid/MedReasoning-v3.2", split="train")
+ds = load_dataset("", split="train")
 print(f"Dataset size: {len(ds)}")
 
 def format_dataset(examples):
